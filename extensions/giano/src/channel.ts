@@ -11,6 +11,7 @@ import {
   setAccountEnabledInConfigSection,
   type ChannelPlugin,
   type OpenClawConfig,
+  type ReplyPayload,
 } from "openclaw/plugin-sdk";
 
 import { getGianoRuntime } from "./runtime.js";
@@ -497,7 +498,7 @@ export const gianoPlugin: ChannelPlugin<ResolvedGianoAccount> = {
       }
 
       const result = await bot.sendMessage(to, text, {
-        replyToMessageId: replyToId,
+        replyToId: replyToId,
       });
 
       return {
@@ -626,16 +627,84 @@ export const gianoPlugin: ChannelPlugin<ResolvedGianoAccount> = {
           const userId = msgCtx.userId;
           const text = msgCtx.text ?? "";
           const messageId = msgCtx.messageId;
+          const isGroup = msgCtx.message?.chat?.type === "group";
+          const senderName = msgCtx.message?.from?.username ?? userId;
 
-          // Forward to OpenClaw runtime for processing
-          await getGianoRuntime().channel.giano.handleInboundMessage({
+          const runtime = getGianoRuntime();
+          const cfg = await runtime.config.loadConfig();
+
+          // Resolve agent route
+          const route = runtime.channel.routing.resolveAgentRoute({
+            cfg,
+            channel: "giano",
             accountId: account.accountId,
-            chatId,
-            userId,
-            text,
-            messageId,
-            isGroup: msgCtx.message?.chat?.type === "group",
-            replyToMessageId: msgCtx.message?.replyToMessageId,
+            peer: {
+              kind: isGroup ? "group" : "direct",
+              id: chatId,
+            },
+          });
+
+          // Format message envelope
+          const rawBody = text;
+          const body = runtime.channel.reply.formatAgentEnvelope({
+            channel: "Giano",
+            from: senderName,
+            timestamp: Date.now(),
+            envelope: runtime.channel.reply.resolveEnvelopeFormatOptions(cfg),
+            body: rawBody,
+          });
+
+          // Build inbound context
+          const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+            Body: body,
+            RawBody: rawBody,
+            CommandBody: rawBody,
+            From: `giano:user:${userId}`,
+            To: `giano:chat:${chatId}`,
+            SessionKey: route.sessionKey,
+            AccountId: route.accountId,
+            ChatType: isGroup ? "group" : "direct",
+            ConversationLabel: chatId,
+            SenderName: senderName,
+            SenderId: userId,
+            SenderUsername: senderName,
+            Provider: "giano",
+            Surface: "giano",
+            MessageSid: messageId,
+            OriginatingChannel: "giano",
+            OriginatingTo: `giano:chat:${chatId}`,
+          });
+
+          // Record session
+          const storePath = runtime.channel.session.resolveStorePath(
+            cfg.session?.store,
+            { agentId: route.agentId },
+          );
+          await runtime.channel.session.recordInboundSession({
+            storePath,
+            sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+            ctx: ctxPayload,
+            onRecordError: (err: unknown) => {
+              ctx.log?.error?.(
+                `[${account.accountId}] Failed updating session meta: ${String(err)}`,
+              );
+            },
+          });
+
+          // Dispatch reply
+          await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg,
+            dispatcherOptions: {
+              deliver: async (payload: ReplyPayload) => {
+                const botInstance = activeBots.get(account.accountId);
+                if (botInstance && payload.text) {
+                  await botInstance.sendMessage(chatId, payload.text, {
+                    replyToId: messageId,
+                  });
+                }
+              },
+            },
           });
         } catch (error) {
           ctx.log?.error?.(
@@ -665,7 +734,7 @@ export const gianoPlugin: ChannelPlugin<ResolvedGianoAccount> = {
       });
     },
 
-    logoutAccount: async ({ accountId }) => {
+    logoutAccount: async ({ accountId }: { accountId: string }) => {
       const bot = activeBots.get(accountId);
       if (bot) {
         await bot.stop();

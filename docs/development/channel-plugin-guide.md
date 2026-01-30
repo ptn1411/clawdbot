@@ -238,35 +238,95 @@ export function getMyChannelRuntime(): PluginRuntime {
 
 ```typescript
 interface PluginRuntime {
+  // Config management
+  config: {
+    loadConfig: () => OpenClawConfig;
+    writeConfigFile: (cfg: OpenClawConfig) => Promise<void>;
+  };
+
   // Channel-specific APIs
   channel: {
-    // Các functions cho từng channel type
-    mychannel: {
-      sendMessage: (
-        to: string,
-        text: string,
-        opts?: SendOptions,
-      ) => Promise<SendResult>;
-      probeConnection: (token: string, timeout: number) => Promise<ProbeResult>;
-      monitorProvider: (opts: MonitorOptions) => Promise<void>;
-      // ... other channel-specific functions
+    // Routing
+    routing: {
+      resolveAgentRoute: (params: {
+        cfg: OpenClawConfig;
+        channel: string;
+        accountId: string;
+        peer: { kind: "direct" | "group"; id: string };
+      }) => { agentId: string; sessionKey: string; accountId: string };
     };
+
+    // Reply handling
+    reply: {
+      formatAgentEnvelope: (params: {
+        channel: string;
+        from: string;
+        timestamp: number;
+        envelope: object;
+        body: string;
+      }) => string;
+
+      resolveEnvelopeFormatOptions: (cfg: OpenClawConfig) => object;
+
+      finalizeInboundContext: (params: Record<string, unknown>) => object;
+
+      dispatchReplyWithBufferedBlockDispatcher: (params: {
+        ctx: object;
+        cfg: OpenClawConfig;
+        dispatcherOptions: {
+          deliver: (payload: ReplyPayload) => Promise<void>;
+        };
+      }) => Promise<void>;
+
+      resolveEffectiveMessagesConfig: (
+        cfg: OpenClawConfig,
+        agentId?: string,
+      ) => object;
+      resolveHumanDelayConfig: (
+        cfg: OpenClawConfig,
+        agentId?: string,
+      ) => object;
+    };
+
+    // Session management
+    session: {
+      resolveStorePath: (store: unknown, opts: { agentId: string }) => string;
+      recordInboundSession: (params: {
+        storePath: string;
+        sessionKey: string;
+        ctx: object;
+        onRecordError: (err: unknown) => void;
+      }) => Promise<void>;
+    };
+
     // Text utilities
     text: {
       chunkMarkdownText: (text: string, limit: number) => string[];
+      resolveMarkdownTableMode: (params: {
+        cfg: OpenClawConfig;
+        channel: string;
+        accountId: string;
+      }) => "off" | "plain" | "markdown" | "bullets" | "code";
     };
-  };
-
-  // Config management
-  config: {
-    writeConfigFile: (cfg: OpenClawConfig) => Promise<void>;
-    readConfigFile: () => Promise<OpenClawConfig>;
   };
 
   // Logging
   logging: {
     shouldLogVerbose: () => boolean;
-    shouldLogDebug: () => boolean;
+    getChildLogger: (
+      bindings?: object,
+      opts?: { level?: string },
+    ) => {
+      debug?: (message: string) => void;
+      info: (message: string) => void;
+      warn: (message: string) => void;
+      error: (message: string) => void;
+    };
+  };
+
+  // State directory
+  state: {
+    resolveStateDir: () => string;
   };
 }
 ```
@@ -890,42 +950,124 @@ export const myChannelPlugin: ChannelPlugin<ResolvedMyChannelAccount> = {
     startAccount: async (ctx) => {
       const account = ctx.account;
       const token = account.token.trim();
-      let botLabel = "";
 
-      // 1. Probe connection để lấy bot info
-      try {
-        const probe = await getMyChannelRuntime().channel.mychannel.probeConnection(
-          token,
-          2500
-        );
-        const username = probe.ok ? probe.bot?.username?.trim() : null;
-        if (username) botLabel = ` (@${username})`;
+      ctx.log?.info(`[${account.accountId}] starting provider`);
 
-        // Update status với bot info
-        ctx.setStatus({
-          accountId: account.accountId,
-          bot: probe.bot,
-        });
-      } catch (err) {
-        if (getMyChannelRuntime().logging.shouldLogVerbose()) {
-          ctx.log?.debug?.(`[${account.accountId}] bot probe failed: ${String(err)}`);
+      // 1. Tạo instance của bot/client SDK
+      const bot = new MyChannelBot(token, {
+        // ... config options
+      });
+
+      // 2. Handle incoming messages
+      bot.on("message", async (msgCtx) => {
+        try {
+          const chatId = msgCtx.chatId;
+          const userId = msgCtx.userId;
+          const text = msgCtx.text ?? "";
+          const messageId = msgCtx.messageId;
+          const isGroup = msgCtx.chat?.type === "group";
+          const senderName = msgCtx.from?.username ?? userId;
+
+          const runtime = getMyChannelRuntime();
+          const cfg = await runtime.config.loadConfig();
+
+          // 3. Resolve agent route
+          const route = runtime.channel.routing.resolveAgentRoute({
+            cfg,
+            channel: "mychannel",
+            accountId: account.accountId,
+            peer: {
+              kind: isGroup ? "group" : "direct",
+              id: chatId,
+            },
+          });
+
+          // 4. Format message envelope
+          const rawBody = text;
+          const body = runtime.channel.reply.formatAgentEnvelope({
+            channel: "MyChannel",
+            from: senderName,
+            timestamp: Date.now(),
+            envelope: runtime.channel.reply.resolveEnvelopeFormatOptions(cfg),
+            body: rawBody,
+          });
+
+          // 5. Build inbound context
+          const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+            Body: body,
+            RawBody: rawBody,
+            CommandBody: rawBody,
+            From: `mychannel:user:${userId}`,
+            To: `mychannel:chat:${chatId}`,
+            SessionKey: route.sessionKey,
+            AccountId: route.accountId,
+            ChatType: isGroup ? "group" : "direct",
+            ConversationLabel: chatId,
+            SenderName: senderName,
+            SenderId: userId,
+            SenderUsername: senderName,
+            Provider: "mychannel",
+            Surface: "mychannel",
+            MessageSid: messageId,
+            OriginatingChannel: "mychannel",
+            OriginatingTo: `mychannel:chat:${chatId}`,
+          });
+
+          // 6. Record session
+          const storePath = runtime.channel.session.resolveStorePath(
+            cfg.session?.store,
+            { agentId: route.agentId }
+          );
+          await runtime.channel.session.recordInboundSession({
+            storePath,
+            sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+            ctx: ctxPayload,
+            onRecordError: (err: unknown) => {
+              ctx.log?.error?.(
+                `[${account.accountId}] Failed updating session meta: ${String(err)}`
+              );
+            },
+          });
+
+          // 7. Dispatch reply - Agent xử lý và trả response
+          await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg,
+            dispatcherOptions: {
+              deliver: async (payload: ReplyPayload) => {
+                // Gửi response qua platform API
+                if (payload.text) {
+                  await bot.sendMessage(chatId, payload.text, {
+                    replyToId: messageId,
+                  });
+                }
+              },
+            },
+          });
+        } catch (error) {
+          ctx.log?.error?.(
+            `[${account.accountId}] message handler error: ${String(error)}`
+          );
         }
-      }
+      });
 
-      // 2. Log startup
-      ctx.log?.info(`[${account.accountId}] starting provider${botLabel}`);
+      // 8. Handle errors
+      bot.on("error", (error) => {
+        ctx.log?.error?.(`[${account.accountId}] bot error: ${String(error)}`);
+      });
 
-      // 3. Start monitoring provider
-      // Function này nên return khi connection đóng hoặc abort signal triggered
-      return getMyChannelRuntime().channel.mychannel.monitorProvider({
-        token,
-        accountId: account.accountId,
-        config: ctx.cfg,
-        runtime: ctx.runtime,
-        abortSignal: ctx.abortSignal,
-        // Channel-specific options
-        mediaMaxMb: account.config.mediaMaxMb,
-        historyLimit: account.config.historyLimit,
+      // 9. Start the bot
+      await bot.start();
+
+      ctx.log?.info(`[${account.accountId}] provider connected`);
+
+      // 10. Wait for abort signal to cleanup
+      return new Promise<void>((resolve) => {
+        ctx.abortSignal?.addEventListener("abort", async () => {
+          ctx.log?.info(`[${account.accountId}] stopping provider`);
+          await bot.stop();
+          resolve();
+        });
       });
     },
 
@@ -933,11 +1075,8 @@ export const myChannelPlugin: ChannelPlugin<ResolvedMyChannelAccount> = {
      * Logout một account (optional)
      * Được gọi khi user logout hoặc token bị revoke
      */
-    logoutAccount: async ({ accountId, cfg }) => {
-      // Clear token từ config
-      const nextCfg = { ...cfg };
-      // ... implement logout logic
-
+    logoutAccount: async ({ accountId }: { accountId: string }) => {
+      // Cleanup resources if needed
       return {
         cleared: true,
         envToken: Boolean(process.env.MYCHANNEL_TOKEN),
@@ -947,6 +1086,16 @@ export const myChannelPlugin: ChannelPlugin<ResolvedMyChannelAccount> = {
   },
 }
 ```
+
+> **Quan trọng:**
+>
+> Pattern xử lý inbound message bao gồm các bước:
+>
+> 1. `resolveAgentRoute()` - Xác định agent nào sẽ xử lý message
+> 2. `formatAgentEnvelope()` - Format message envelope với metadata
+> 3. `finalizeInboundContext()` - Tạo context object hoàn chỉnh
+> 4. `recordInboundSession()` - Ghi session để tracking
+> 5. `dispatchReplyWithBufferedBlockDispatcher()` - Dispatch message tới agent và gửi response
 
 ---
 
@@ -1535,35 +1684,132 @@ export const myChannelPlugin: ChannelPlugin<ResolvedMyChannelAccount> = {
     startAccount: async (ctx) => {
       const account = ctx.account;
       const token = account.token.trim();
-      let botLabel = "";
 
-      try {
-        const probe =
-          await getMyChannelRuntime().channel.mychannel.probeConnection(
-            token,
-            2500,
+      ctx.log?.info(`[${account.accountId}] starting provider`);
+
+      // Tạo bot instance
+      const bot = new MyChannelBot(token, {
+        // config options...
+      });
+
+      // Handle incoming messages
+      bot.on("message", async (msgCtx) => {
+        try {
+          const chatId = msgCtx.chatId;
+          const userId = msgCtx.userId;
+          const text = msgCtx.text ?? "";
+          const messageId = msgCtx.messageId;
+          const isGroup = msgCtx.chat?.type === "group";
+          const senderName = msgCtx.from?.username ?? userId;
+
+          const runtime = getMyChannelRuntime();
+          const cfg = await runtime.config.loadConfig();
+
+          // Resolve agent route
+          const route = runtime.channel.routing.resolveAgentRoute({
+            cfg,
+            channel: "mychannel",
+            accountId: account.accountId,
+            peer: {
+              kind: isGroup ? "group" : "direct",
+              id: chatId,
+            },
+          });
+
+          // Format message envelope
+          const rawBody = text;
+          const body = runtime.channel.reply.formatAgentEnvelope({
+            channel: "MyChannel",
+            from: senderName,
+            timestamp: Date.now(),
+            envelope: runtime.channel.reply.resolveEnvelopeFormatOptions(cfg),
+            body: rawBody,
+          });
+
+          // Build inbound context
+          const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+            Body: body,
+            RawBody: rawBody,
+            CommandBody: rawBody,
+            From: `mychannel:user:${userId}`,
+            To: `mychannel:chat:${chatId}`,
+            SessionKey: route.sessionKey,
+            AccountId: route.accountId,
+            ChatType: isGroup ? "group" : "direct",
+            ConversationLabel: chatId,
+            SenderName: senderName,
+            SenderId: userId,
+            SenderUsername: senderName,
+            Provider: "mychannel",
+            Surface: "mychannel",
+            MessageSid: messageId,
+            OriginatingChannel: "mychannel",
+            OriginatingTo: `mychannel:chat:${chatId}`,
+          });
+
+          // Record session
+          const storePath = runtime.channel.session.resolveStorePath(
+            cfg.session?.store,
+            { agentId: route.agentId },
           );
-        const username = probe.ok ? probe.bot?.username?.trim() : null;
-        if (username) botLabel = ` (@${username})`;
-      } catch (err) {
-        if (getMyChannelRuntime().logging.shouldLogVerbose()) {
-          ctx.log?.debug?.(
-            `[${account.accountId}] bot probe failed: ${String(err)}`,
+          await runtime.channel.session.recordInboundSession({
+            storePath,
+            sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+            ctx: ctxPayload,
+            onRecordError: (err: unknown) => {
+              ctx.log?.error?.(
+                `[${account.accountId}] Failed updating session meta: ${String(err)}`,
+              );
+            },
+          });
+
+          // Dispatch reply
+          await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg,
+            dispatcherOptions: {
+              deliver: async (payload: ReplyPayload) => {
+                if (payload.text) {
+                  await bot.sendMessage(chatId, payload.text, {
+                    replyToId: messageId,
+                  });
+                }
+              },
+            },
+          });
+        } catch (error) {
+          ctx.log?.error?.(
+            `[${account.accountId}] message handler error: ${String(error)}`,
           );
         }
-      }
-
-      ctx.log?.info(`[${account.accountId}] starting provider${botLabel}`);
-
-      return getMyChannelRuntime().channel.mychannel.monitorProvider({
-        token,
-        accountId: account.accountId,
-        config: ctx.cfg,
-        runtime: ctx.runtime,
-        abortSignal: ctx.abortSignal,
-        mediaMaxMb: account.config.mediaMaxMb,
-        historyLimit: account.config.historyLimit,
       });
+
+      // Handle errors
+      bot.on("error", (error) => {
+        ctx.log?.error?.(`[${account.accountId}] bot error: ${String(error)}`);
+      });
+
+      // Start the bot
+      await bot.start();
+
+      ctx.log?.info(`[${account.accountId}] provider connected`);
+
+      // Wait for abort signal
+      return new Promise<void>((resolve) => {
+        ctx.abortSignal?.addEventListener("abort", async () => {
+          ctx.log?.info(`[${account.accountId}] stopping provider`);
+          await bot.stop();
+          resolve();
+        });
+      });
+    },
+
+    logoutAccount: async ({ accountId }: { accountId: string }) => {
+      return {
+        cleared: true,
+        envToken: Boolean(process.env.MYCHANNEL_TOKEN),
+        loggedOut: true,
+      };
     },
   },
 };
