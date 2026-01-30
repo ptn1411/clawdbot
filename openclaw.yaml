@@ -1,0 +1,10 @@
+# Cấu hình OpenClaw
+
+channels:
+  giano:
+    token: "0e877e1a-485c-463f-a2f1-892139719183:VxlL8nFeRbu4wKLbTpWxkJ7kPyyaSE7O"
+    apiBaseUrl: "https://messages-api.bug.edu.vn"
+    wsUrl: "wss://messages-api.bug.edu.vn/bot/ws"
+    dm:
+      policy: "open"
+    groupPolicy: "open"
